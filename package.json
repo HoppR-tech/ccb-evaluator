@@ -1,0 +1,17 @@
+{
+  "name": "@hoppr/ccb-evaluator",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Public static-analysis runner for CodeConform-Bench.",
+  "type": "module",
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "devDependencies": {
+    "dependency-cruiser": "18.2.0",
+    "typescript": "6.0.3"
+  }
+}
