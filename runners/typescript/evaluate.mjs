@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process'
+import { createRequire } from 'node:module'
 import { lstat, mkdir, opendir, realpath, stat, writeFile } from 'node:fs/promises'
 import { dirname, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -50,38 +51,71 @@ async function inspectCandidateTree(candidate) {
 }
 
 async function analyze(candidate, ruleConfig) {
-  return new Promise((resolveEvaluation) => {
-    let output = ''
-    let outputBytes = 0
-    let outputTooLarge = false
-    const child = spawn(process.execPath, [depcruise, '--config', ruleConfig, '--output-type', 'json', '--no-progress', '.'], {
-      cwd: candidate,
-      stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: ANALYZER_TIMEOUT_MS,
-    })
-
-    child.stdout.on('data', (chunk) => {
-      outputBytes += chunk.length
-      if (outputBytes > MAX_ANALYZER_OUTPUT_BYTES) {
-        outputTooLarge = true
-        child.kill()
-        return
-      }
-      output += chunk
-    })
-    child.stderr.resume()
-    child.on('error', () => resolveEvaluation({ status: 'evaluator_error' }))
-    child.on('close', (code, signal) => {
-      if (signal || code === null || outputTooLarge) return resolveEvaluation({ status: 'evaluator_error' })
-      try {
-        const violations = JSON.parse(output).summary.error
-        if (!Number.isInteger(violations) || violations < 0) return resolveEvaluation({ status: 'evaluator_error' })
-        return resolveEvaluation(violations === 0 ? { status: 'passing', violations } : { status: 'failing', violations })
-      } catch {
-        return resolveEvaluation({ status: 'evaluator_error' })
-      }
-    })
+  const { promise, resolve: resolveEvaluation } = Promise.withResolvers()
+  let output = ''
+  let outputBytes = 0
+  let outputTooLarge = false
+  const child = spawn(process.execPath, [depcruise, '--config', ruleConfig, '--output-type', 'json', '--no-progress', '.'], {
+    cwd: candidate,
+    stdio: ['ignore', 'pipe', 'pipe'],
+    timeout: ANALYZER_TIMEOUT_MS,
   })
+
+  child.stdout.on('data', (chunk) => {
+    outputBytes += chunk.length
+    if (outputBytes > MAX_ANALYZER_OUTPUT_BYTES) {
+      outputTooLarge = true
+      child.kill()
+      return
+    }
+    output += chunk
+  })
+  child.stderr.resume()
+  child.on('error', () => resolveEvaluation(null))
+  child.on('close', (code, signal) => {
+    if (signal || code === null || outputTooLarge) return resolveEvaluation(null)
+    try {
+      return resolveEvaluation(JSON.parse(output))
+    } catch {
+      return resolveEvaluation(null)
+    }
+  })
+  return promise
+}
+
+function score(graph, expectations) {
+  const errors = graph?.summary?.error
+  if (!Number.isInteger(errors) || errors < 0 || !Array.isArray(graph.modules)) return { status: 'evaluator_error' }
+
+  const checks = []
+  for (const expectation of expectations.requiredModules ?? []) {
+    checks.push({ passed: graph.modules.some((module) => new RegExp(expectation.path).test(module.source)), weight: expectation.weight })
+  }
+  for (const expectation of expectations.requiredDependencies ?? []) {
+    checks.push({
+      passed: graph.modules.some((module) =>
+        new RegExp(expectation.from).test(module.source)
+        && module.dependencies.some((dependency) => new RegExp(expectation.to).test(dependency.resolved))
+      ),
+      weight: expectation.weight,
+    })
+  }
+  checks.push({ passed: errors === 0, weight: expectations.dependencyCruiserWeight })
+
+  if (checks.length === 0 || checks.some((check) => !Number.isFinite(check.weight) || check.weight <= 0)) {
+    return { status: 'evaluator_error' }
+  }
+  const passed = checks.filter((check) => check.passed)
+  const rawScore = passed.length / checks.length
+  const totalWeight = checks.reduce((total, check) => total + check.weight, 0)
+  const weightedScore = passed.reduce((total, check) => total + check.weight, 0) / totalWeight
+  const violations = errors + checks.length - passed.length
+  return {
+    status: violations === 0 ? 'passing' : 'failing',
+    violations,
+    score: rawScore,
+    weightedScore,
+  }
 }
 
 let evaluation
@@ -94,7 +128,8 @@ try {
     throw new Error('candidate must be a directory and rule-config must be a file')
   }
   await inspectCandidateTree(candidate)
-  evaluation = await analyze(candidate, ruleConfig)
+  const rulePack = createRequire(import.meta.url)(ruleConfig)
+  evaluation = score(await analyze(candidate, ruleConfig), rulePack.ccb ?? {})
 } catch {
   evaluation = { status: 'evaluator_error' }
 }

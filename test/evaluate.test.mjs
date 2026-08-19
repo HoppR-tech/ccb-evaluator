@@ -22,12 +22,12 @@ async function evaluate(fixture) {
   return evaluateCandidate(resolve(root, 'test/fixtures', fixture))
 }
 
-test('returns an aggregate pass result for a compliant fixture', async () => {
-  assert.deepEqual(await evaluate('passing'), { status: 'passing', violations: 0 })
+test('returns an aggregate pass result for a complete compliant slice', async () => {
+  assert.deepEqual(await evaluate('passing'), { status: 'passing', violations: 0, score: 1, weightedScore: 1 })
 })
 
 test('returns an aggregate failure result without diagnostics', async () => {
-  assert.deepEqual(await evaluate('failing'), { status: 'failing', violations: 1 })
+  assert.deepEqual(await evaluate('failing'), { status: 'failing', violations: 9, score: 0, weightedScore: 0 })
 })
 
 test('counts more than 255 violations without using the process exit code', async () => {
@@ -39,7 +39,7 @@ test('counts more than 255 violations without using the process exit code', asyn
     writeFile(resolve(candidate, `api/src/domain/model-${index}.ts`), "import { client } from '../infrastructure/client'\nexport { client }\n")
   ))
 
-  assert.deepEqual(await evaluateCandidate(candidate), { status: 'failing', violations: 256 })
+  assert.deepEqual(await evaluateCandidate(candidate), { status: 'failing', violations: 264, score: 0, weightedScore: 0 })
 })
 
 test('rejects candidate symlinks before static analysis', async () => {
