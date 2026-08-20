@@ -154,12 +154,37 @@ function callName(node) {
   if (ts.isPropertyAccessExpression(node.expression)) return `${node.expression.expression.getText()}.${node.expression.name.text}`
   return ''
 }
+function normalizedModulePath(path) {
+  return path.replace(/^\.\//, '').replaceAll('\\', '/')
+}
 
-async function sourceEvaluation(files, quality) {
+function dependencyClosure(graph, entryPoints) {
+  if (!Array.isArray(graph?.modules)) return new Set()
+  const patterns = entryPoints.map((pattern) => new RegExp(pattern))
+  const modules = new Map(graph.modules.map((module) => [normalizedModulePath(module.source), module]))
+  const selected = new Set([...modules.keys()].filter((source) => patterns.some((pattern) => pattern.test(source))))
+  const pending = [...selected]
+  while (pending.length > 0) {
+    const module = modules.get(pending.pop())
+    for (const dependency of module?.dependencies ?? []) {
+      const resolved = normalizedModulePath(dependency.resolved)
+      if (!modules.has(resolved) || selected.has(resolved)) continue
+      selected.add(resolved)
+      pending.push(resolved)
+    }
+  }
+  return selected
+}
+
+async function sourceEvaluation(files, graph, quality) {
   const sourcePatterns = quality.sourceFiles.map((pattern) => new RegExp(pattern))
   const testPatterns = quality.testFiles.map((pattern) => new RegExp(pattern))
-  const sourceEntries = files.filter((file) => sourcePatterns.some((pattern) => pattern.test(file.relativePath)))
+  const reachable = dependencyClosure(graph, quality.entryPoints)
   const testEntries = files.filter((file) => testPatterns.some((pattern) => pattern.test(file.relativePath)))
+  const testPaths = new Set(testEntries.map((file) => file.relativePath))
+  const sourceEntries = files.filter((file) => !testPaths.has(file.relativePath) && (
+    sourcePatterns.some((pattern) => pattern.test(file.relativePath)) || reachable.has(file.relativePath)
+  ))
   const limits = quality.limits
   const metrics = {
     sourceFiles: sourceEntries.length,
@@ -184,7 +209,7 @@ async function sourceEvaluation(files, quality) {
     const sourceFile = ts.createSourceFile(entry.relativePath, text, ts.ScriptTarget.Latest, true, entry.relativePath.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS)
     const lineCount = sourceFile.getLineAndCharacterOfPosition(sourceFile.end).line + 1
     if (sourceEntries.includes(entry)) metrics.maxFileLines = Math.max(metrics.maxFileLines, lineCount)
-    metrics.suppressions += (text.match(/@ts-(?:ignore|nocheck)|eslint-disable/g) ?? []).length
+    metrics.suppressions += (text.match(/@ts-(?:ignore|nocheck|expect-error)|eslint-disable/g) ?? []).length
 
     function visit(node) {
       if (node.kind === ts.SyntaxKind.AnyKeyword) metrics.anyTypes += 1
@@ -200,12 +225,35 @@ async function sourceEvaluation(files, quality) {
       if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier) && quality.dangerousImports.includes(node.moduleSpecifier.text)) {
         metrics.dangerousImports += 1
       }
+      if (
+        ts.isImportEqualsDeclaration(node)
+        && ts.isExternalModuleReference(node.moduleReference)
+        && ts.isStringLiteral(node.moduleReference.expression)
+        && quality.dangerousImports.includes(node.moduleReference.expression.text)
+      ) metrics.dangerousImports += 1
+      if (ts.isVariableDeclaration(node) && node.initializer) {
+        const aliasTarget = ts.isIdentifier(node.initializer)
+          ? node.initializer.text
+          : ts.isPropertyAccessExpression(node.initializer)
+            ? node.initializer.getText()
+            : ''
+        if (quality.dangerousCalls.includes(aliasTarget)) metrics.dangerousCalls += 1
+      }
       if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
         const name = callName(node)
         if (quality.dangerousCalls.includes(name)) metrics.dangerousCalls += 1
+        if (ts.isCallExpression(node)) {
+          const moduleName = node.arguments[0]
+          if (
+            (name === 'require' || node.expression.kind === ts.SyntaxKind.ImportKeyword)
+            && moduleName
+            && ts.isStringLiteral(moduleName)
+            && quality.dangerousImports.includes(moduleName.text)
+          ) metrics.dangerousImports += 1
+        }
         if (testEntries.includes(entry)) {
           if (/^(?:test|it)(?:\.(?:skip|only|todo))?$/.test(name)) metrics.testCases += 1
-          if (/^(?:test|it)\.(?:skip|only|todo)$/.test(name)) metrics.focusedOrSkippedTests += 1
+          if (/\.(?:skip|only|todo)$/.test(name)) metrics.focusedOrSkippedTests += 1
           if (name === 'expect' || name.startsWith('assert.')) metrics.assertions += 1
         }
       }
@@ -288,9 +336,10 @@ try {
   const files = await inspectCandidateTree(candidate)
   const rulePack = createRequire(import.meta.url)(ruleConfig).ccb
   if (!rulePack?.quality) throw new Error('rule pack must define ccb.quality')
-  const architecture = architectureEvaluation(await analyzeDependencies(candidate, ruleConfig), rulePack.architecture)
+  const graph = await analyzeDependencies(candidate, ruleConfig)
+  const architecture = architectureEvaluation(graph, rulePack.architecture)
   if (architecture === null) throw new Error('architecture analysis failed')
-  const source = await sourceEvaluation(files, rulePack.quality)
+  const source = await sourceEvaluation(files, graph, rulePack.quality)
   evaluation = finalEvaluation(architecture, source, rulePack.quality)
 } catch {
   evaluation = { status: 'evaluator_error' }

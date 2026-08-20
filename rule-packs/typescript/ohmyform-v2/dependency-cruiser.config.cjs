@@ -36,6 +36,12 @@ const config = {
       from: { path: '^api/src/application' },
       to: { path: '^(?:@nestjs|typeorm)' },
     },
+    {
+      name: 'legacy-submission-start-mutation-must-not-remain-registered',
+      severity: 'error',
+      from: { path: '^api/src/resolver/submission/index' },
+      to: { path: '^api/src/resolver/submission/submission\\.start\\.mutation' },
+    },
   ],
   options: {
     tsPreCompilationDeps: true,
@@ -54,14 +60,20 @@ Object.defineProperty(config, 'ccb', {
       requiredDependencies: [
         { from: '^api/src/application/.*submission', to: '^api/src/domain/.*submission', weight: 2 },
         { from: '^api/src/infrastructure/.*submission', to: '^api/src/(application|domain)/.*submission', weight: 2 },
-        { from: '^api/src/interface/.*submission', to: '^api/src/application/.*submission', weight: 1 },
+        { from: '^api/src/interface/.*submission', to: '^api/src/application/.*submission', weight: 2 },
+        { from: '^api/src/resolver/submission/index', to: '^api/src/interface/.*submission', weight: 3 },
+        { from: '^api/src/service/submission/submission\\.start\\.service', to: '^api/src/application/.*submission', weight: 3 },
       ],
       dependencyCruiserWeight: 4,
     },
     quality: {
-      sourceFiles: ['^api/src/(?:domain|application|infrastructure|interface)/.*submission.*\\.tsx?$'],
+      sourceFiles: ['^api/src/(?:domain|application|infrastructure|interface)/.*\\.tsx?$'],
+      entryPoints: [
+        '^api/src/interface/.*submission',
+        '^api/src/service/submission/submission\\.start\\.service',
+      ],
       testFiles: ['^api/(?:src|test)/.*submission.*(?:spec|test)\\.tsx?$'],
-      dangerousCalls: ['eval', 'Function'],
+      dangerousCalls: ['eval', 'Function', 'globalThis.eval', 'globalThis.Function'],
       dangerousImports: ['child_process', 'node:child_process', 'vm', 'node:vm'],
       limits: {
         maxFileLines: 300,
@@ -83,7 +95,7 @@ Object.defineProperty(config, 'ccb', {
         architecture: 0.75,
         maintainability: 0.8,
         clarity: 0.75,
-        tests: 0.5,
+        tests: 1,
         robustness: 1,
       },
       qualifiedThreshold: 0.7,
