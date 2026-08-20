@@ -35,10 +35,10 @@ test('returns multidimensional quality for a complete compliant slice', async ()
 test('scores every quality dimension without exposing diagnostics', async () => {
   assert.deepEqual(await evaluate('failing'), {
     status: 'failing',
-    violations: 14,
-    qualityScore: 0.5875,
+    violations: 17,
+    qualityScore: 0.6163636363636364,
     qualityQualified: false,
-    dimensions: { architecture: 0, maintainability: 1, clarity: 1, tests: 0.25, robustness: 1 },
+    dimensions: { architecture: 0.12121212121212122, maintainability: 1, clarity: 1, tests: 0.2, robustness: 1 },
   })
 })
 
@@ -53,10 +53,10 @@ test('counts more than 255 violations without using the process exit code', asyn
 
   assert.deepEqual(await evaluateCandidate(candidate), {
     status: 'failing',
-    violations: 269,
-    qualityScore: 0.5875,
+    violations: 272,
+    qualityScore: 0.6163636363636364,
     qualityQualified: false,
-    dimensions: { architecture: 0, maintainability: 1, clarity: 1, tests: 0.25, robustness: 1 },
+    dimensions: { architecture: 0.12121212121212122, maintainability: 1, clarity: 1, tests: 0.2, robustness: 1 },
   })
 })
 
@@ -78,9 +78,14 @@ test('disqualifies an unused architecture facade', async () => {
 test('scores transitive source and dangerous syntax forms', async () => {
   const candidate = await mkdtemp(resolve(tmpdir(), 'ccb-evaluator-dangerous-'))
   await cp(resolve(root, 'test/fixtures/passing'), candidate, { recursive: true })
+  await mkdir(resolve(candidate, 'api/src/shared'), { recursive: true })
   await writeFile(
-    resolve(candidate, 'api/src/application/start.ts'),
-    `import process = require('node:child_process')\n// @ts-expect-error benchmark fixture\nconst run = globalThis.eval\nexport const unsafe = () => run(process)\n`,
+    resolve(candidate, 'api/src/shared/start.ts'),
+    `// @ts-expect-error benchmark fixture\nconst req = require\nconst process = req(\`node:child_process\`)\nconst run = globalThis['eval']\nexport const unsafe = () => run(process)\n`,
+  )
+  await writeFile(
+    resolve(candidate, 'api/src/application/start-submission.ts'),
+    `import type { SubmissionRepository } from '../domain/submission-repository'\nimport { unsafe } from '../shared/start'\nexport class StartSubmission {\n  constructor(private readonly submissions: SubmissionRepository) {}\n  execute(id: string): Promise<void> {\n    unsafe()\n    return this.submissions.save(id)\n  }\n}\n`,
   )
 
   const result = await evaluateCandidate(candidate)
@@ -90,18 +95,18 @@ test('scores transitive source and dangerous syntax forms', async () => {
   assert.equal(result.dimensions.robustness, 0.5)
 })
 
-test('does not double-count test files as source files', async () => {
+test('requires assertions inside each counted test case', async () => {
   const candidate = await mkdtemp(resolve(tmpdir(), 'ccb-evaluator-tests-'))
   await cp(resolve(root, 'test/fixtures/passing'), candidate, { recursive: true })
   await writeFile(
     resolve(candidate, 'api/src/application/start-submission.test.ts'),
-    `import assert from 'node:assert/strict'\nimport test from 'node:test'\ntest('one', () => assert.ok(true))\ntest('two', () => assert.ok(true))\n`,
+    `import assert from 'node:assert/strict'\nimport test from 'node:test'\ntest('one', () => {})\ntest('two', () => {})\ntest('three', () => {})\nassert.ok(true)\nassert.ok(true)\nassert.ok(true)\n`,
   )
 
   const result = await evaluateCandidate(candidate)
   assert.equal(result.status, 'failing')
   assert.equal(result.qualityQualified, false)
-  assert.equal(result.dimensions.tests, 0.5)
+  assert.equal(result.dimensions.tests, 0.6)
 })
 
 test('rejects candidate symlinks before static analysis', async () => {

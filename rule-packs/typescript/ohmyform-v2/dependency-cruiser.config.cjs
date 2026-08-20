@@ -61,8 +61,15 @@ Object.defineProperty(config, 'ccb', {
         { from: '^api/src/application/.*submission', to: '^api/src/domain/.*submission', weight: 2 },
         { from: '^api/src/infrastructure/.*submission', to: '^api/src/(application|domain)/.*submission', weight: 2 },
         { from: '^api/src/interface/.*submission', to: '^api/src/application/.*submission', weight: 2 },
+      ],
+      requiredReachability: [
         { from: '^api/src/resolver/submission/index', to: '^api/src/interface/.*submission', weight: 3 },
         { from: '^api/src/service/submission/submission\\.start\\.service', to: '^api/src/application/.*submission', weight: 3 },
+        { from: '^api/src/app\\.providers', to: '^api/src/application/.*submission', weight: 3 },
+        { from: '^api/src/app\\.providers', to: '^api/src/infrastructure/.*submission', weight: 3 },
+      ],
+      forbiddenReachability: [
+        { from: '^api/src/resolver/submission/index', to: '^api/src/resolver/submission/submission\\.start\\.mutation', weight: 4 },
       ],
       dependencyCruiserWeight: 4,
     },

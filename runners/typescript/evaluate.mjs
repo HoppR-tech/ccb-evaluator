@@ -93,6 +93,25 @@ function checkScore(checks) {
   const totalWeight = checks.reduce((total, check) => total + check.weight, 0)
   return checks.filter((check) => check.passed).reduce((total, check) => total + check.weight, 0) / totalWeight
 }
+function dependencyPathExists(graph, fromPattern, toPattern) {
+  const from = new RegExp(fromPattern)
+  const to = new RegExp(toPattern)
+  const modules = new Map(graph.modules.map((module) => [normalizedModulePath(module.source), module]))
+  const pending = [...modules.keys()].filter((source) => from.test(source))
+  const visited = new Set(pending)
+  while (pending.length > 0) {
+    const source = pending.pop()
+    if (source !== undefined && to.test(source)) return true
+    for (const dependency of modules.get(source)?.dependencies ?? []) {
+      const resolved = normalizedModulePath(dependency.resolved)
+      if (!modules.has(resolved) || visited.has(resolved)) continue
+      visited.add(resolved)
+      pending.push(resolved)
+    }
+  }
+  return false
+}
+
 
 function architectureEvaluation(graph, expectations) {
   const errors = graph?.summary?.error
@@ -108,6 +127,18 @@ function architectureEvaluation(graph, expectations) {
         new RegExp(expectation.from).test(module.source)
         && module.dependencies.some((dependency) => new RegExp(expectation.to).test(dependency.resolved))
       ),
+      weight: expectation.weight,
+    })
+  }
+  for (const expectation of expectations.requiredReachability ?? []) {
+    checks.push({
+      passed: dependencyPathExists(graph, expectation.from, expectation.to),
+      weight: expectation.weight,
+    })
+  }
+  for (const expectation of expectations.forbiddenReachability ?? []) {
+    checks.push({
+      passed: !dependencyPathExists(graph, expectation.from, expectation.to),
       weight: expectation.weight,
     })
   }
@@ -149,26 +180,54 @@ function functionComplexity(root) {
   return complexity
 }
 
-function callName(node) {
-  if (ts.isIdentifier(node.expression)) return node.expression.text
-  if (ts.isPropertyAccessExpression(node.expression)) return `${node.expression.expression.getText()}.${node.expression.name.text}`
+function staticText(node) {
+  return ts.isStringLiteral(node) || ts.isNoSubstitutionTemplateLiteral(node) ? node.text : null
+}
+
+function expressionName(expression) {
+  if (ts.isIdentifier(expression)) return expression.text
+  if (ts.isPropertyAccessExpression(expression)) {
+    const owner = expressionName(expression.expression)
+    return owner ? `${owner}.${expression.name.text}` : expression.getText()
+  }
+  if (ts.isElementAccessExpression(expression) && expression.argumentExpression) {
+    const owner = expressionName(expression.expression)
+    const property = staticText(expression.argumentExpression)
+    return owner && property ? `${owner}.${property}` : ''
+  }
   return ''
+}
+
+function assertionCount(root) {
+  let assertions = 0
+  function visit(node) {
+    if (node !== root && isFunctionLike(node)) return
+    if (ts.isCallExpression(node)) {
+      const name = expressionName(node.expression)
+      if (name === 'expect' || name.startsWith('assert.')) assertions += 1
+    }
+    ts.forEachChild(node, visit)
+  }
+  visit(root)
+  return assertions
 }
 function normalizedModulePath(path) {
   return path.replace(/^\.\//, '').replaceAll('\\', '/')
 }
 
-function dependencyClosure(graph, entryPoints) {
+function dependencyClosure(graph, patterns, excludedPaths) {
   if (!Array.isArray(graph?.modules)) return new Set()
-  const patterns = entryPoints.map((pattern) => new RegExp(pattern))
+  const matchers = patterns.map((pattern) => new RegExp(pattern))
   const modules = new Map(graph.modules.map((module) => [normalizedModulePath(module.source), module]))
-  const selected = new Set([...modules.keys()].filter((source) => patterns.some((pattern) => pattern.test(source))))
+  const selected = new Set([...modules.keys()].filter((source) =>
+    !excludedPaths.has(source) && matchers.some((pattern) => pattern.test(source))
+  ))
   const pending = [...selected]
   while (pending.length > 0) {
-    const module = modules.get(pending.pop())
-    for (const dependency of module?.dependencies ?? []) {
+    const source = pending.pop()
+    for (const dependency of modules.get(source)?.dependencies ?? []) {
       const resolved = normalizedModulePath(dependency.resolved)
-      if (!modules.has(resolved) || selected.has(resolved)) continue
+      if (!modules.has(resolved) || selected.has(resolved) || excludedPaths.has(resolved)) continue
       selected.add(resolved)
       pending.push(resolved)
     }
@@ -179,12 +238,13 @@ function dependencyClosure(graph, entryPoints) {
 async function sourceEvaluation(files, graph, quality) {
   const sourcePatterns = quality.sourceFiles.map((pattern) => new RegExp(pattern))
   const testPatterns = quality.testFiles.map((pattern) => new RegExp(pattern))
-  const reachable = dependencyClosure(graph, quality.entryPoints)
   const testEntries = files.filter((file) => testPatterns.some((pattern) => pattern.test(file.relativePath)))
   const testPaths = new Set(testEntries.map((file) => file.relativePath))
-  const sourceEntries = files.filter((file) => !testPaths.has(file.relativePath) && (
-    sourcePatterns.some((pattern) => pattern.test(file.relativePath)) || reachable.has(file.relativePath)
-  ))
+  const reachable = dependencyClosure(graph, [...quality.sourceFiles, ...quality.entryPoints], testPaths)
+  const sourceEntries = files.filter((file) =>
+    !testPaths.has(file.relativePath)
+    && (reachable.has(file.relativePath) || sourcePatterns.some((pattern) => pattern.test(file.relativePath)))
+  )
   const limits = quality.limits
   const metrics = {
     sourceFiles: sourceEntries.length,
@@ -197,6 +257,7 @@ async function sourceEvaluation(files, graph, quality) {
     suppressions: 0,
     nonNullAssertions: 0,
     testCases: 0,
+    testCasesWithAssertions: 0,
     assertions: 0,
     focusedOrSkippedTests: 0,
     emptyCatches: 0,
@@ -207,6 +268,8 @@ async function sourceEvaluation(files, graph, quality) {
   for (const entry of [...sourceEntries, ...testEntries]) {
     const text = await readFile(entry.path, 'utf8')
     const sourceFile = ts.createSourceFile(entry.relativePath, text, ts.ScriptTarget.Latest, true, entry.relativePath.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS)
+    const dangerousCallAliases = new Set(quality.dangerousCalls)
+    const dangerousImportAliases = new Set(['require'])
     const lineCount = sourceFile.getLineAndCharacterOfPosition(sourceFile.end).line + 1
     if (sourceEntries.includes(entry)) metrics.maxFileLines = Math.max(metrics.maxFileLines, lineCount)
     metrics.suppressions += (text.match(/@ts-(?:ignore|nocheck|expect-error)|eslint-disable/g) ?? []).length
@@ -222,39 +285,44 @@ async function sourceEvaluation(files, graph, quality) {
         metrics.maxComplexity = Math.max(metrics.maxComplexity, functionComplexity(node))
       }
       if (ts.isCatchClause(node) && node.block.statements.length === 0) metrics.emptyCatches += 1
-      if (ts.isImportDeclaration(node) && ts.isStringLiteral(node.moduleSpecifier) && quality.dangerousImports.includes(node.moduleSpecifier.text)) {
-        metrics.dangerousImports += 1
+      if (ts.isImportDeclaration(node)) {
+        const moduleName = staticText(node.moduleSpecifier)
+        if (moduleName && quality.dangerousImports.includes(moduleName)) metrics.dangerousImports += 1
       }
-      if (
-        ts.isImportEqualsDeclaration(node)
-        && ts.isExternalModuleReference(node.moduleReference)
-        && ts.isStringLiteral(node.moduleReference.expression)
-        && quality.dangerousImports.includes(node.moduleReference.expression.text)
-      ) metrics.dangerousImports += 1
-      if (ts.isVariableDeclaration(node) && node.initializer) {
-        const aliasTarget = ts.isIdentifier(node.initializer)
-          ? node.initializer.text
-          : ts.isPropertyAccessExpression(node.initializer)
-            ? node.initializer.getText()
-            : ''
-        if (quality.dangerousCalls.includes(aliasTarget)) metrics.dangerousCalls += 1
+      if (ts.isImportEqualsDeclaration(node) && ts.isExternalModuleReference(node.moduleReference)) {
+        const moduleName = node.moduleReference.expression ? staticText(node.moduleReference.expression) : null
+        if (moduleName && quality.dangerousImports.includes(moduleName)) metrics.dangerousImports += 1
+      }
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+        const aliasTarget = expressionName(node.initializer)
+        if (dangerousCallAliases.has(aliasTarget)) {
+          dangerousCallAliases.add(node.name.text)
+          metrics.dangerousCalls += 1
+        }
+        if (dangerousImportAliases.has(aliasTarget)) dangerousImportAliases.add(node.name.text)
       }
       if (ts.isCallExpression(node) || ts.isNewExpression(node)) {
-        const name = callName(node)
-        if (quality.dangerousCalls.includes(name)) metrics.dangerousCalls += 1
+        const name = expressionName(node.expression)
+        if (dangerousCallAliases.has(name)) metrics.dangerousCalls += 1
         if (ts.isCallExpression(node)) {
-          const moduleName = node.arguments[0]
+          const moduleName = node.arguments[0] ? staticText(node.arguments[0]) : null
           if (
-            (name === 'require' || node.expression.kind === ts.SyntaxKind.ImportKeyword)
+            (dangerousImportAliases.has(name) || node.expression.kind === ts.SyntaxKind.ImportKeyword)
             && moduleName
-            && ts.isStringLiteral(moduleName)
-            && quality.dangerousImports.includes(moduleName.text)
+            && quality.dangerousImports.includes(moduleName)
           ) metrics.dangerousImports += 1
         }
         if (testEntries.includes(entry)) {
-          if (/^(?:test|it)(?:\.(?:skip|only|todo))?$/.test(name)) metrics.testCases += 1
+          if (/^(?:test|it)$/.test(name)) {
+            const callback = node.arguments.find((argument) => isFunctionLike(argument))
+            if (callback) {
+              const assertions = assertionCount(callback)
+              metrics.testCases += 1
+              metrics.assertions += assertions
+              if (assertions > 0) metrics.testCasesWithAssertions += 1
+            }
+          }
           if (/\.(?:skip|only|todo)$/.test(name)) metrics.focusedOrSkippedTests += 1
-          if (name === 'expect' || name.startsWith('assert.')) metrics.assertions += 1
         }
       }
       ts.forEachChild(node, visit)
@@ -279,6 +347,7 @@ async function sourceEvaluation(files, graph, quality) {
     tests: [
       metrics.testFiles >= limits.minTestFiles,
       metrics.testCases >= limits.minTestCases,
+      metrics.testCasesWithAssertions >= limits.minTestCases,
       metrics.assertions >= limits.minAssertions,
       metrics.focusedOrSkippedTests === 0,
     ],
