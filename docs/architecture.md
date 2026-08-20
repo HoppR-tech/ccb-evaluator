@@ -19,7 +19,7 @@ read/write]
 not mounted] --> evaluator[Evaluator job]
     workspace --> evaluator
     evaluatorRepo --> evaluator
-    evaluator --> result[Aggregate score]
+    evaluator --> result[Score plus canonical evidence]
 ```
 
 The sandbox must enforce all of the following:
@@ -37,4 +37,4 @@ A public rule pack can be known outside the sandbox, including through future mo
 
 ## Runner boundary
 
-The TypeScript runner combines dependency-cruiser boundary checks with TypeScript AST metrics for maintainability, clarity, tests, and robustness. It does not execute candidate application code, install candidate dependencies, or emit raw analyzer diagnostics in its aggregate result. The runner may read a public rule pack only after the candidate agent has finished.
+The TypeScript runner combines dependency-cruiser boundary checks with TypeScript AST metrics for maintainability, clarity, tests, and robustness. It does not execute candidate application code or install candidate dependencies. It discards raw analyzer output and emits only a versioned evidence model with normalized candidate-relative paths, bounded redacted inline diagnostics, complete redacted scored-source files plus original digests, complete score-determining paths, score reconciliation data, and the complete normalized dependency graph. Source/result size limits fail closed as `evaluator_error`; they never turn complete canonical proof into a truncated scored result. The runner reads the public rule pack and creates this human-facing evidence only after the candidate agent has finished; it is never returned to the model.
