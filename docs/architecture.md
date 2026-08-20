@@ -37,4 +37,4 @@ A public rule pack can be known outside the sandbox, including through future mo
 
 ## Runner boundary
 
-The TypeScript runner invokes dependency-cruiser as static analysis. It does not execute candidate application code, install candidate dependencies, or emit raw analyzer diagnostics in its aggregate result. The runner may read a public rule pack only after the candidate agent has finished.
+The TypeScript runner combines dependency-cruiser boundary checks with TypeScript AST metrics for maintainability, clarity, tests, and robustness. It does not execute candidate application code, install candidate dependencies, or emit raw analyzer diagnostics in its aggregate result. The runner may read a public rule pack only after the candidate agent has finished.

@@ -22,7 +22,7 @@ See [the evaluator architecture](docs/architecture.md). The implementation follo
 
 - `runners/typescript/evaluate.mjs` — static TypeScript evaluator.
 - `test/fixtures/` — public runner fixtures.
-- public OhMyForm v1 architecture rules — public rule-pack location.
+- public OhMyForm v2 code-quality rules — public rule-pack location.
 - `manifests/campaigns/` — immutable campaign provenance records.
 
 ## Runner contract
@@ -34,13 +34,25 @@ node runners/typescript/evaluate.mjs \
   --result /results/aggregate.json
 ```
 
-The runner writes one aggregate JSON object:
+The runner writes one aggregate JSON object. Scores are normalized to `[0, 1]`; raw analyzer diagnostics are never emitted:
 
 ```json
-{"status":"passing","violations":0}
+{
+  "status": "passing",
+  "violations": 0,
+  "qualityScore": 1,
+  "qualityQualified": true,
+  "dimensions": {
+    "architecture": 1,
+    "maintainability": 1,
+    "clarity": 1,
+    "tests": 1,
+    "robustness": 1
+  }
+}
 ```
 
-Possible statuses are `passing`, `failing`, and `evaluator_error`. A non-zero dependency-cruiser result becomes `failing`; raw analyzer output is not emitted.
+Possible statuses are `passing`, `failing`, and `evaluator_error`. The rule pack versions the dimension weights, minimums, and qualification threshold. A candidate is `passing` only when its weighted quality score and every dimension minimum pass. Dependency boundaries and TypeScript source metrics are evaluated deterministically; evaluator failures remain distinct from candidate failures.
 
 ## Local verification
 
@@ -49,4 +61,4 @@ npm ci --ignore-scripts
 npm test
 ```
 
-The fixtures demonstrate the runner contract only. They are not an OhMyForm campaign rule pack.
+The fixtures calibrate the public runner contract and active OhMyForm rule pack; campaign repositories remain responsible for functional verification.

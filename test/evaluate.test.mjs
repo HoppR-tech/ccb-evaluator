@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url'
 const execFileAsync = promisify(execFile)
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const runner = resolve(root, 'runners/typescript/evaluate.mjs')
-const config = resolve(root, 'rule-packs', 'typescript', 'ohmyform-v1', 'dependency-cruiser.config.cjs')
+const config = resolve(root, 'rule-packs', 'typescript', 'ohmyform-v2', 'dependency-cruiser.config.cjs')
 
 async function evaluateCandidate(candidate) {
   const output = resolve(await mkdtemp(resolve(tmpdir(), 'ccb-evaluator-result-')), 'result.json')
@@ -22,12 +22,24 @@ async function evaluate(fixture) {
   return evaluateCandidate(resolve(root, 'test/fixtures', fixture))
 }
 
-test('returns an aggregate pass result for a complete compliant slice', async () => {
-  assert.deepEqual(await evaluate('passing'), { status: 'passing', violations: 0, score: 1, weightedScore: 1 })
+test('returns multidimensional quality for a complete compliant slice', async () => {
+  assert.deepEqual(await evaluate('passing'), {
+    status: 'passing',
+    violations: 0,
+    qualityScore: 1,
+    qualityQualified: true,
+    dimensions: { architecture: 1, maintainability: 1, clarity: 1, tests: 1, robustness: 1 },
+  })
 })
 
-test('returns an aggregate failure result without diagnostics', async () => {
-  assert.deepEqual(await evaluate('failing'), { status: 'failing', violations: 9, score: 0, weightedScore: 0 })
+test('scores every quality dimension without exposing diagnostics', async () => {
+  assert.deepEqual(await evaluate('failing'), {
+    status: 'failing',
+    violations: 15,
+    qualityScore: 0.4625,
+    qualityQualified: false,
+    dimensions: { architecture: 0, maintainability: 0.8, clarity: 0.75, tests: 0.25, robustness: 0.75 },
+  })
 })
 
 test('counts more than 255 violations without using the process exit code', async () => {
@@ -39,7 +51,13 @@ test('counts more than 255 violations without using the process exit code', asyn
     writeFile(resolve(candidate, `api/src/domain/model-${index}.ts`), "import { client } from '../infrastructure/client'\nexport { client }\n")
   ))
 
-  assert.deepEqual(await evaluateCandidate(candidate), { status: 'failing', violations: 264, score: 0, weightedScore: 0 })
+  assert.deepEqual(await evaluateCandidate(candidate), {
+    status: 'failing',
+    violations: 270,
+    qualityScore: 0.4625,
+    qualityQualified: false,
+    dimensions: { architecture: 0, maintainability: 0.8, clarity: 0.75, tests: 0.25, robustness: 0.75 },
+  })
 })
 
 test('rejects candidate symlinks before static analysis', async () => {
