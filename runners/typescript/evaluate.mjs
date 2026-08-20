@@ -111,15 +111,84 @@ function dependencyPathExists(graph, fromPattern, toPattern) {
   }
   return false
 }
+async function parsedSource(files, pathPattern) {
+  const pattern = new RegExp(pathPattern)
+  const file = files.find((entry) => pattern.test(entry.relativePath))
+  if (!file) return null
+  const text = await readFile(file.path, 'utf8')
+  return ts.createSourceFile(file.relativePath, text, ts.ScriptTarget.Latest, true, file.relativePath.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS)
+}
+
+function importedSources(sourceFile) {
+  const sources = new Map()
+  for (const statement of sourceFile.statements) {
+    if (!ts.isImportDeclaration(statement) || !statement.importClause) continue
+    const moduleName = staticText(statement.moduleSpecifier)
+    if (!moduleName) continue
+    if (statement.importClause.name) sources.set(statement.importClause.name.text, moduleName)
+    const bindings = statement.importClause.namedBindings
+    if (bindings && ts.isNamespaceImport(bindings)) sources.set(bindings.name.text, moduleName)
+    if (bindings && ts.isNamedImports(bindings)) {
+      for (const element of bindings.elements) sources.set(element.name.text, moduleName)
+    }
+  }
+  return sources
+}
+
+async function registeredImportExists(files, expectation) {
+  const sourceFile = await parsedSource(files, expectation.module)
+  if (!sourceFile) return false
+  const imports = importedSources(sourceFile)
+  const importPath = new RegExp(expectation.importPath)
+  for (const statement of sourceFile.statements) {
+    if (!ts.isVariableStatement(statement) || !statement.modifiers?.some((modifier) => modifier.kind === ts.SyntaxKind.ExportKeyword)) continue
+    for (const declaration of statement.declarationList.declarations) {
+      if (!ts.isIdentifier(declaration.name) || declaration.name.text !== expectation.exportName || !declaration.initializer || !ts.isArrayLiteralExpression(declaration.initializer)) continue
+      return declaration.initializer.elements.some((element) => {
+        const value = ts.isSpreadElement(element) ? element.expression : element
+        return ts.isIdentifier(value) && importPath.test(imports.get(value.text) ?? '')
+      })
+    }
+  }
+  return false
+}
+
+async function objectPropertyImportExists(files, expectation) {
+  const sourceFile = await parsedSource(files, expectation.module)
+  if (!sourceFile) return false
+  const imports = importedSources(sourceFile)
+  const importPath = new RegExp(expectation.importPath)
+  let passed = false
+  function visit(node) {
+    if (passed || !ts.isCallExpression(node) || expressionName(node.expression) !== expectation.call) {
+      if (!passed) ts.forEachChild(node, visit)
+      return
+    }
+    const object = node.arguments[0]
+    if (!object || !ts.isObjectLiteralExpression(object)) return
+    passed = object.properties.some((property) => {
+      if (ts.isShorthandPropertyAssignment(property) && property.name.text === expectation.property) {
+        return importPath.test(imports.get(property.name.text) ?? '')
+      }
+      if (ts.isPropertyAssignment(property) && property.name.getText(sourceFile).replaceAll(/[\"']/g, '') === expectation.property && ts.isIdentifier(property.initializer)) {
+        return importPath.test(imports.get(property.initializer.text) ?? '')
+      }
+      return false
+    })
+  }
+  visit(sourceFile)
+  return passed
+}
 
 
-function architectureEvaluation(graph, expectations) {
+
+async function architectureEvaluation(graph, expectations, files) {
   const errors = graph?.summary?.error
   if (!Number.isInteger(errors) || errors < 0 || !Array.isArray(graph.modules)) return null
 
   const checks = []
   for (const expectation of expectations.requiredModules ?? []) {
-    checks.push({ passed: graph.modules.some((module) => new RegExp(expectation.path).test(module.source)), weight: expectation.weight })
+    checks.push({ passed: graph.modules.some((module) => new RegExp(expectation.path).test(module.source)), weight: expectation.weight, mandatory: expectation.mandatory === true })
   }
   for (const expectation of expectations.requiredDependencies ?? []) {
     checks.push({
@@ -128,24 +197,49 @@ function architectureEvaluation(graph, expectations) {
         && module.dependencies.some((dependency) => new RegExp(expectation.to).test(dependency.resolved))
       ),
       weight: expectation.weight,
+      mandatory: expectation.mandatory === true,
     })
   }
   for (const expectation of expectations.requiredReachability ?? []) {
     checks.push({
       passed: dependencyPathExists(graph, expectation.from, expectation.to),
       weight: expectation.weight,
+      mandatory: expectation.mandatory === true,
     })
   }
   for (const expectation of expectations.forbiddenReachability ?? []) {
     checks.push({
       passed: !dependencyPathExists(graph, expectation.from, expectation.to),
       weight: expectation.weight,
+      mandatory: expectation.mandatory === true,
     })
   }
-  checks.push({ passed: errors === 0, weight: expectations.dependencyCruiserWeight })
+  for (const expectation of expectations.requiredRegistrations ?? []) {
+    checks.push({
+      passed: await registeredImportExists(files, expectation),
+      weight: expectation.weight,
+      mandatory: expectation.mandatory === true,
+    })
+  }
+  for (const expectation of expectations.requiredObjectProperties ?? []) {
+    checks.push({
+      passed: await objectPropertyImportExists(files, expectation),
+      weight: expectation.weight,
+      mandatory: expectation.mandatory === true,
+    })
+  }
+  checks.push({
+    passed: errors === 0,
+    weight: expectations.dependencyCruiserWeight,
+    mandatory: expectations.dependencyCruiserMandatory === true,
+  })
   const score = checkScore(checks)
   if (score === null) return null
-  return { score, violations: errors + checks.filter((check) => !check.passed).length }
+  return {
+    score,
+    qualified: checks.every((check) => !check.mandatory || check.passed),
+    violations: errors + checks.filter((check) => !check.passed).length,
+  }
 }
 
 function isFunctionLike(node) {
@@ -270,6 +364,31 @@ async function sourceEvaluation(files, graph, quality) {
     const sourceFile = ts.createSourceFile(entry.relativePath, text, ts.ScriptTarget.Latest, true, entry.relativePath.endsWith('.tsx') ? ts.ScriptKind.TSX : ts.ScriptKind.TS)
     const dangerousCallAliases = new Set(quality.dangerousCalls)
     const dangerousImportAliases = new Set(['require'])
+    const aliases = []
+    const namedCallbacks = new Map()
+    function collectDeclarations(node) {
+      if (ts.isFunctionDeclaration(node) && node.name) namedCallbacks.set(node.name.text, node)
+      if (ts.isVariableDeclaration(node) && ts.isIdentifier(node.name) && node.initializer) {
+        aliases.push({ name: node.name.text, target: expressionName(node.initializer) })
+        if (isFunctionLike(node.initializer)) namedCallbacks.set(node.name.text, node.initializer)
+      }
+      ts.forEachChild(node, collectDeclarations)
+    }
+    collectDeclarations(sourceFile)
+    let aliasesChanged
+    do {
+      aliasesChanged = false
+      for (const alias of aliases) {
+        if (dangerousCallAliases.has(alias.target) && !dangerousCallAliases.has(alias.name)) {
+          dangerousCallAliases.add(alias.name)
+          aliasesChanged = true
+        }
+        if (dangerousImportAliases.has(alias.target) && !dangerousImportAliases.has(alias.name)) {
+          dangerousImportAliases.add(alias.name)
+          aliasesChanged = true
+        }
+      }
+    } while (aliasesChanged)
     const lineCount = sourceFile.getLineAndCharacterOfPosition(sourceFile.end).line + 1
     if (sourceEntries.includes(entry)) metrics.maxFileLines = Math.max(metrics.maxFileLines, lineCount)
     metrics.suppressions += (text.match(/@ts-(?:ignore|nocheck|expect-error)|eslint-disable/g) ?? []).length
@@ -314,7 +433,10 @@ async function sourceEvaluation(files, graph, quality) {
         }
         if (testEntries.includes(entry)) {
           if (/^(?:test|it)$/.test(name)) {
-            const callback = node.arguments.find((argument) => isFunctionLike(argument))
+            const argument = [...node.arguments].reverse().find((candidate) =>
+              isFunctionLike(candidate) || (ts.isIdentifier(candidate) && namedCallbacks.has(candidate.text))
+            )
+            const callback = argument && ts.isIdentifier(argument) ? namedCallbacks.get(argument.text) : argument
             if (callback) {
               const assertions = assertionCount(callback)
               metrics.testCases += 1
@@ -377,7 +499,8 @@ function finalEvaluation(architecture, source, quality) {
   if (DIMENSIONS.some((dimension) => !Number.isFinite(weights[dimension]) || weights[dimension] <= 0)) return { status: 'evaluator_error' }
   const totalWeight = DIMENSIONS.reduce((total, dimension) => total + weights[dimension], 0)
   const qualityScore = DIMENSIONS.reduce((total, dimension) => total + dimensions[dimension] * weights[dimension], 0) / totalWeight
-  const qualityQualified = qualityScore >= quality.qualifiedThreshold
+  const qualityQualified = architecture.qualified
+    && qualityScore >= quality.qualifiedThreshold
     && DIMENSIONS.every((dimension) => dimensions[dimension] >= quality.minimums[dimension])
   const violations = architecture.violations
     + source.maintainability.violations
@@ -406,7 +529,7 @@ try {
   const rulePack = createRequire(import.meta.url)(ruleConfig).ccb
   if (!rulePack?.quality) throw new Error('rule pack must define ccb.quality')
   const graph = await analyzeDependencies(candidate, ruleConfig)
-  const architecture = architectureEvaluation(graph, rulePack.architecture)
+  const architecture = await architectureEvaluation(graph, rulePack.architecture, files)
   if (architecture === null) throw new Error('architecture analysis failed')
   const source = await sourceEvaluation(files, graph, rulePack.quality)
   evaluation = finalEvaluation(architecture, source, rulePack.quality)
