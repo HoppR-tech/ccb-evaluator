@@ -10,7 +10,7 @@ import { fileURLToPath } from 'node:url'
 const execFileAsync = promisify(execFile)
 const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const runner = resolve(root, 'runners/typescript/evaluate.mjs')
-const config = resolve(root, 'rule-packs', 'typescript', 'ohmyform-v2', 'dependency-cruiser.config.cjs')
+const config = resolve(root, 'rule-packs', 'typescript', 'ohmyform-v3', 'dependency-cruiser.config.cjs')
 
 async function evaluateCandidate(candidate, ruleConfig = config) {
   const output = resolve(await mkdtemp(resolve(tmpdir(), 'ccb-evaluator-result-')), 'result.json')
@@ -118,13 +118,33 @@ test('returns reconciled per-check evidence for a complete compliant slice', asy
   assert.deepEqual(path.locations.map(({ path: file, line }) => [file, line]), [['api/src/app.providers.ts', 2]])
 })
 
+test('accepts the equivalent feature-first clean-architecture layout', async () => {
+  const result = await evaluate('passing-feature-first')
+  assert.equal(result.status, 'passing')
+  assert.equal(result.violations, 0)
+  assert.equal(result.qualityScore, 1)
+  assert.equal(result.qualityQualified, true)
+  assert.deepEqual(result.dimensions, { architecture: 1, maintainability: 1, clarity: 1, tests: 1, robustness: 1 })
+  assertEvidenceReconciles(result)
+  const architecture = result.evidence.dimensions.find((dimension) => dimension.dimension === 'architecture')
+  assert.equal(
+    architecture.checks.some((check) => check.id === 'architecture.required-path.legacy-service-application'),
+    false,
+  )
+  const path = architecture.checks.find((check) => check.id === 'architecture.required-path.providers-infrastructure')
+  assert.deepEqual(path.paths[0].nodes, [
+    'api/src/app.providers.ts',
+    'api/src/submission/infrastructure/typeorm-submission-repository.ts',
+  ])
+})
+
 test('explains every failing score with bounded source and structure evidence', async () => {
   const result = await evaluate('failing')
   assert.equal(result.status, 'failing')
-  assert.equal(result.violations, 21)
-  assert.equal(result.qualityScore, 0.6066666666666667)
+  assert.equal(result.violations, 20)
+  assert.equal(result.qualityScore, 0.6085714285714287)
   assert.equal(result.qualityQualified, false)
-  assert.deepEqual(result.dimensions, { architecture: 0.08888888888888889, maintainability: 1, clarity: 1, tests: 0.2, robustness: 1 })
+  assert.deepEqual(result.dimensions, { architecture: 0.09523809523809523, maintainability: 1, clarity: 1, tests: 0.2, robustness: 1 })
   assertEvidenceReconciles(result)
   assert.deepEqual(result.evidence.structure, {
     nodes: ['api/src/domain/model.ts', 'api/src/infrastructure/client.ts'],
@@ -154,10 +174,10 @@ test('counts more than 255 violations without using the process exit code', asyn
 
   const result = await evaluateCandidate(candidate)
   assert.equal(result.status, 'failing')
-  assert.equal(result.violations, 276)
-  assert.equal(result.qualityScore, 0.6066666666666667)
+  assert.equal(result.violations, 275)
+  assert.equal(result.qualityScore, 0.6085714285714287)
   assert.equal(result.qualityQualified, false)
-  assert.deepEqual(result.dimensions, { architecture: 0.08888888888888889, maintainability: 1, clarity: 1, tests: 0.2, robustness: 1 })
+  assert.deepEqual(result.dimensions, { architecture: 0.09523809523809523, maintainability: 1, clarity: 1, tests: 0.2, robustness: 1 })
   assertEvidenceReconciles(result)
 })
 
