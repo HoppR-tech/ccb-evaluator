@@ -12,9 +12,9 @@ const root = resolve(dirname(fileURLToPath(import.meta.url)), '..')
 const runner = resolve(root, 'runners/typescript/evaluate.mjs')
 const config = resolve(root, 'rule-packs', 'typescript', 'ohmyform-v2', 'dependency-cruiser.config.cjs')
 
-async function evaluateCandidate(candidate) {
+async function evaluateCandidate(candidate, ruleConfig = config) {
   const output = resolve(await mkdtemp(resolve(tmpdir(), 'ccb-evaluator-result-')), 'result.json')
-  await execFileAsync(process.execPath, [runner, '--candidate', candidate, '--rule-config', config, '--result', output])
+  await execFileAsync(process.execPath, [runner, '--candidate', candidate, '--rule-config', ruleConfig, '--result', output])
   return JSON.parse(await readFile(output, 'utf8'))
 }
 
@@ -316,11 +316,19 @@ test('counts assertions in named test callbacks', async () => {
   assert.equal(result.dimensions.tests, 1)
 })
 
-test('rejects candidate symlinks before static analysis', async () => {
+test('rejects candidate symlinks with a stable bounded diagnostic', async () => {
   const candidate = await mkdtemp(resolve(tmpdir(), 'ccb-evaluator-symlink-'))
   await symlink(tmpdir(), resolve(candidate, 'outside'))
 
-  assert.deepEqual(await evaluateCandidate(candidate), { status: 'evaluator_error' })
+  assert.deepEqual(await evaluateCandidate(candidate), {
+    status: 'evaluator_error',
+    diagnostic: {
+      schemaVersion: 1,
+      phase: 'candidate_inspection',
+      code: 'candidate_tree_invalid',
+      reason: 'candidate must not contain symbolic links',
+    },
+  })
 })
 
 test('rejects a candidate root symlink before static analysis', async () => {
@@ -329,5 +337,43 @@ test('rejects a candidate root symlink before static analysis', async () => {
   const candidate = resolve(parent, 'candidate')
   await symlink(target, candidate)
 
-  assert.deepEqual(await evaluateCandidate(candidate), { status: 'evaluator_error' })
+  assert.deepEqual(await evaluateCandidate(candidate), {
+    status: 'evaluator_error',
+    diagnostic: {
+      schemaVersion: 1,
+      phase: 'candidate_inspection',
+      code: 'candidate_tree_invalid',
+      reason: 'candidate must not be a symbolic link',
+    },
+  })
+})
+
+test('reports inaccessible candidates without exposing the host path', async () => {
+  const parent = await mkdtemp(resolve(tmpdir(), 'ccb-evaluator-missing-'))
+  const candidate = resolve(parent, 'missing-candidate')
+  const result = await evaluateCandidate(candidate)
+  assert.equal(result.status, 'evaluator_error')
+  assert.equal(result.diagnostic.schemaVersion, 1)
+  assert.equal(result.diagnostic.phase, 'candidate_inspection')
+  assert.equal(result.diagnostic.code, 'candidate_access_failed')
+  assert.ok(result.diagnostic.reason.length <= 240)
+  assert.ok(!result.diagnostic.reason.includes(parent))
+  assert.match(result.diagnostic.reason, /\[REDACTED_PATH\]/)
+})
+
+test('reports invalid rule packs as a stable rule-pack failure', async () => {
+  const candidate = resolve(root, 'test/fixtures/passing')
+  const directory = await mkdtemp(resolve(tmpdir(), 'ccb-evaluator-invalid-rule-'))
+  const invalidConfig = resolve(directory, 'invalid.cjs')
+  await writeFile(invalidConfig, 'module.exports = {}\n')
+  const result = await evaluateCandidate(candidate, invalidConfig)
+  assert.deepEqual(result, {
+    status: 'evaluator_error',
+    diagnostic: {
+      schemaVersion: 1,
+      phase: 'rule_pack',
+      code: 'rule_pack_invalid',
+      reason: 'rule pack must define ccb architecture and quality settings',
+    },
+  })
 })

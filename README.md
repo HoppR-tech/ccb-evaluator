@@ -142,17 +142,37 @@ The abbreviated arrays above omit records for readability. Each scoring check ha
 Possible statuses are `passing`, `failing`, and `evaluator_error`. The rule pack versions the
 dimension weights, minimums, qualification threshold, and architecture check IDs. A candidate is
 `passing` only when its weighted quality score and every dimension minimum pass. Dependency
-boundaries and TypeScript source metrics are evaluated deterministically. Evaluator failures
-remain distinct from candidate failures and have no evidence payload.
+boundaries and TypeScript source metrics are evaluated deterministically.
+
+`evaluator_error` is a versioned safe contract rather than an empty sentinel:
+
+```json
+{
+  "status": "evaluator_error",
+  "diagnostic": {
+    "schemaVersion": 1,
+    "phase": "dependency_analysis",
+    "code": "dependency_analysis_failed",
+    "reason": "dependency analysis did not produce a valid graph"
+  }
+}
+```
+
+Stable producer phases are `candidate_inspection`, `rule_pack`, `dependency_analysis`,
+`source_analysis`, `serialization`, and `internal`. Codes distinguish inaccessible/invalid/oversized
+candidate trees, unsafe candidate paths, invalid rule packs, failed dependency or source analysis,
+serialization overflow, and an unexpected internal failure. Reasons are redacted, free of host
+paths, and capped at 240 characters. Evaluator failures remain distinct from candidate failures and
+never carry a partial score or evidence payload.
 
 Raw dependency-cruiser output is never emitted because it contains host paths, environment data,
 and unrelated analyzer internals. Canonical evidence instead accepts normalized
 candidate-relative Unicode paths, redacts likely credentials (including URL userinfo) while
 retaining source line structure, caps inline snippets/diagnostic lists, and preserves every
 score-determining path, every evaluated source, and every normalized graph edge. If the complete
-canonical sources or result exceed their fixed safety limits, the run is an `evaluator_error`
-rather than a score with incomplete proof. The evidence is produced post-agent and is never
-returned to the model.
+canonical sources or result exceed their fixed safety limits, the failure contract reports the
+responsible phase/code rather than a score with incomplete proof. The evidence is produced
+post-agent and is never returned to the model.
 
 ## Local verification
 

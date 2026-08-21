@@ -18,6 +18,7 @@ const MAX_SNIPPET_CHARACTERS = 180
 const MAX_EVIDENCE_PATH_CHARACTERS = 1_024
 const MAX_CANONICAL_SOURCE_BYTES = 4 * 1024 * 1024
 const MAX_RESULT_BYTES = 16 * 1024 * 1024
+const MAX_FAILURE_REASON_CHARACTERS = 240
 const runnerRoot = dirname(dirname(dirname(fileURLToPath(import.meta.url))))
 const depcruise = resolve(runnerRoot, 'node_modules/dependency-cruiser/bin/dependency-cruise.mjs')
 const options = Object.fromEntries(
@@ -35,6 +36,43 @@ if (required.some((name) => !options[name])) {
 const result = resolve(options.result)
 await mkdir(dirname(result), { recursive: true })
 
+class EvaluatorFailure extends Error {
+  constructor(phase, code, reason) {
+    super(reason)
+    this.phase = phase
+    this.code = code
+  }
+}
+
+function safeFailureReason(error, fallback) {
+  const value = error instanceof Error ? error.message : typeof error === 'string' ? error : fallback
+  return value
+    .replace(/([a-z][a-z0-9+.-]*:\/\/)([^/\s:@]+):([^@\s/]+)@/gi, '$1[REDACTED]:[REDACTED]@')
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/=-]{8,}\b/gi, 'Bearer [REDACTED]')
+    .replace(/\b(?:AKIA|ASIA)[A-Z0-9]{16}\b/g, '[REDACTED]')
+    .replace(/\bgh[pousr]_[A-Za-z0-9_]{12,}\b/g, '[REDACTED]')
+    .replace(/(?:^|[\s\"'`(=,:])(?:\/(?:Users|home|private|tmp|var|opt|workspace|runner)\/[^\s\"'`),;]*)/g, (match) => `${/^[\s\"'`(=,:]/.test(match) ? match[0] : ''}[REDACTED_PATH]`)
+    .replace(/[\u0000-\u0008\u000b\u000c\u000e-\u001f\u007f]/g, '�')
+    .slice(0, MAX_FAILURE_REASON_CHARACTERS) || fallback
+}
+
+function failureResult(phase, code, reason) {
+  return {
+    status: 'evaluator_error',
+    diagnostic: {
+      schemaVersion: 1,
+      phase,
+      code,
+      reason: safeFailureReason(reason, 'evaluator failed'),
+    },
+  }
+}
+
+function phaseError(error, phase, code, fallback) {
+  return error instanceof EvaluatorFailure
+    ? error
+    : new EvaluatorFailure(phase, code, safeFailureReason(error, fallback))
+}
 async function inspectCandidateTree(candidate) {
   const directories = [candidate]
   const files = []
@@ -46,17 +84,17 @@ async function inspectCandidateTree(candidate) {
     const handle = await opendir(directory)
     for await (const entry of handle) {
       entries += 1
-      if (entries > MAX_CANDIDATE_ENTRIES) throw new Error('candidate exceeds static-analysis limits')
+      if (entries > MAX_CANDIDATE_ENTRIES) throw new EvaluatorFailure('candidate_inspection', 'candidate_limits_exceeded', 'candidate exceeds static-analysis entry limit')
 
       const path = resolve(directory, entry.name)
-      if (entry.isSymbolicLink()) throw new Error('candidate must not contain symbolic links')
+      if (entry.isSymbolicLink()) throw new EvaluatorFailure('candidate_inspection', 'candidate_tree_invalid', 'candidate must not contain symbolic links')
       if (entry.isDirectory()) directories.push(path)
       else if (entry.isFile()) {
         bytes += (await stat(path)).size
-        if (bytes > MAX_CANDIDATE_BYTES) throw new Error('candidate exceeds static-analysis limits')
+        if (bytes > MAX_CANDIDATE_BYTES) throw new EvaluatorFailure('candidate_inspection', 'candidate_limits_exceeded', 'candidate exceeds static-analysis byte limit')
         files.push({ path, relativePath: candidateEvidencePath(relative(candidate, path).replaceAll('\\', '/')) })
       } else {
-        throw new Error('candidate must contain only regular files and directories')
+        throw new EvaluatorFailure('candidate_inspection', 'candidate_tree_invalid', 'candidate must contain only regular files and directories')
       }
     }
   }
@@ -104,7 +142,7 @@ function candidateEvidencePath(path) {
     || normalized.startsWith('/')
     || normalized.split('/').some((segment) => segment.length === 0 || segment === '.' || segment === '..')
     || /[\u0000-\u001f\u007f]/.test(normalized)
-  ) throw new Error('candidate path cannot be represented safely')
+  ) throw new EvaluatorFailure('candidate_inspection', 'candidate_path_invalid', 'candidate path cannot be represented safely')
   return normalized
 }
 
@@ -717,7 +755,7 @@ async function sourceEvaluation(files, graph, quality) {
     const canonicalText = text.replaceAll('\r\n', '\n').replaceAll('\r', '\n')
     const redactedSource = redactSecrets(canonicalText)
     sourceBytes += Buffer.byteLength(redactedSource.text)
-    if (sourceBytes > MAX_CANONICAL_SOURCE_BYTES) throw new Error('canonical source evidence exceeds limit')
+    if (sourceBytes > MAX_CANONICAL_SOURCE_BYTES) throw new EvaluatorFailure('source_analysis', 'source_analysis_failed', 'canonical source evidence exceeds limit')
     sources.push({
       path: candidateEvidencePath(entry.relativePath),
       digest: `sha256:${createHash('sha256').update(text).digest('hex')}`,
@@ -969,7 +1007,7 @@ function finalEvaluation(architecture, source, quality) {
       || quality.minimums[dimension] > 1
       || !Number.isFinite(results[dimension].score)
     )
-  ) return { status: 'evaluator_error' }
+  ) return failureResult('rule_pack', 'rule_pack_invalid', 'rule pack quality settings are invalid')
 
   const dimensions = Object.fromEntries(DIMENSIONS.map((dimension) => [dimension, results[dimension].score]))
   const totalWeight = DIMENSIONS.reduce((total, dimension) => total + weights[dimension], 0)
@@ -992,7 +1030,7 @@ function finalEvaluation(architecture, source, quality) {
     }
   })
   const checkIds = evidenceDimensions.flatMap((dimension) => dimension.checks.map((check) => check.id))
-  if (new Set(checkIds).size !== checkIds.length) return { status: 'evaluator_error' }
+  if (new Set(checkIds).size !== checkIds.length) return failureResult('rule_pack', 'rule_pack_invalid', 'rule pack check identifiers must be unique')
   const qualityQualified = qualityScore >= quality.qualifiedThreshold
     && evidenceDimensions.every((dimension) => dimension.qualified)
   const violations = evidenceDimensions.reduce(
@@ -1025,23 +1063,64 @@ function finalEvaluation(architecture, source, quality) {
 let evaluation
 try {
   const candidatePath = resolve(options.candidate)
-  if ((await lstat(candidatePath)).isSymbolicLink()) throw new Error('candidate must not be a symbolic link')
-  const candidate = await realpath(candidatePath)
-  const ruleConfig = await realpath(options['rule-config'])
-  if (!(await stat(candidate)).isDirectory() || (await stat(ruleConfig)).isDirectory()) {
-    throw new Error('candidate must be a directory and rule-config must be a file')
+  let candidatePathStat
+  try {
+    candidatePathStat = await lstat(candidatePath)
+  } catch (error) {
+    throw new EvaluatorFailure('candidate_inspection', 'candidate_access_failed', safeFailureReason(error, 'candidate could not be accessed'))
+  }
+  if (candidatePathStat.isSymbolicLink()) {
+    throw new EvaluatorFailure('candidate_inspection', 'candidate_tree_invalid', 'candidate must not be a symbolic link')
+  }
+  let candidate
+  try {
+    candidate = await realpath(candidatePath)
+    if (!(await stat(candidate)).isDirectory()) {
+      throw new EvaluatorFailure('candidate_inspection', 'candidate_access_failed', 'candidate must be a directory')
+    }
+  } catch (error) {
+    throw phaseError(error, 'candidate_inspection', 'candidate_access_failed', 'candidate could not be inspected')
   }
   const files = await inspectCandidateTree(candidate)
-  const rulePack = createRequire(import.meta.url)(ruleConfig).ccb
-  if (!rulePack?.quality) throw new Error('rule pack must define ccb.quality')
+
+  let ruleConfig
+  let rulePack
+  try {
+    ruleConfig = await realpath(options['rule-config'])
+    if ((await stat(ruleConfig)).isDirectory()) throw new Error('rule config is a directory')
+    rulePack = createRequire(import.meta.url)(ruleConfig).ccb
+    if (!rulePack?.architecture || !rulePack?.quality) throw new Error('rule pack must define ccb architecture and quality settings')
+  } catch (error) {
+    throw new EvaluatorFailure('rule_pack', 'rule_pack_invalid', safeFailureReason(error, 'rule pack could not be loaded'))
+  }
+
   const graph = await analyzeDependencies(candidate, ruleConfig)
-  const architecture = await architectureEvaluation(graph, rulePack.architecture, files)
-  if (architecture === null) throw new Error('architecture analysis failed')
-  const source = await sourceEvaluation(files, graph, rulePack.quality)
+  if (graph === null) {
+    throw new EvaluatorFailure('dependency_analysis', 'dependency_analysis_failed', 'dependency analysis did not produce a valid graph')
+  }
+  let architecture
+  try {
+    architecture = await architectureEvaluation(graph, rulePack.architecture, files)
+    if (architecture === null) throw new Error('architecture analysis returned an invalid score')
+  } catch (error) {
+    throw phaseError(error, 'dependency_analysis', 'dependency_analysis_failed', 'architecture analysis failed')
+  }
+  let source
+  try {
+    source = await sourceEvaluation(files, graph, rulePack.quality)
+  } catch (error) {
+    throw phaseError(error, 'source_analysis', 'source_analysis_failed', 'source analysis failed')
+  }
   evaluation = finalEvaluation(architecture, source, rulePack.quality)
-} catch {
-  evaluation = { status: 'evaluator_error' }
+} catch (error) {
+  evaluation = error instanceof EvaluatorFailure
+    ? failureResult(error.phase, error.code, error.message)
+    : failureResult('internal', 'internal_error', safeFailureReason(error, 'unexpected evaluator failure'))
 }
 
-const serialized = `${JSON.stringify(evaluation)}\n`
-await writeFile(result, Buffer.byteLength(serialized) > MAX_RESULT_BYTES ? '{"status":"evaluator_error"}\n' : serialized)
+let serialized = `${JSON.stringify(evaluation)}\n`
+if (Buffer.byteLength(serialized) > MAX_RESULT_BYTES) {
+  evaluation = failureResult('serialization', 'serialization_failed', 'evaluator result exceeded the serialization limit')
+  serialized = `${JSON.stringify(evaluation)}\n`
+}
+await writeFile(result, serialized)
