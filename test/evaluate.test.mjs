@@ -274,6 +274,66 @@ test('keeps score-determining dependency paths and graph edges complete', async 
   assert.equal(result.evidence.structure.edgesTruncated, false)
 })
 
+test('canonical graph omits unresolved raw specifiers while preserving internal edges', async () => {
+  const candidate = await mkdtemp(resolve(tmpdir(), 'ccb-evaluator-unresolved-'))
+  await cp(resolve(root, 'test/fixtures/passing'), candidate, { recursive: true })
+  const application = resolve(candidate, 'api/src/application/start-submission.ts')
+  await writeFile(
+    application,
+    `import '../assets/submission.svg?url'\nimport './missing-relative-module'\nimport { Injectable } from '@nestjs/common'\n${await readFile(application, 'utf8')}`,
+  )
+
+  const result = await evaluateCandidate(candidate)
+  assert.notEqual(result.status, 'evaluator_error')
+  const structure = result.evidence.structure
+  assert.ok(structure.nodes.includes('api/src/application/start-submission.ts'))
+  assert.ok(structure.nodes.includes('api/src/domain/submission-repository.ts'))
+  assert.ok(structure.edges.some((edge) =>
+    edge.from === 'api/src/application/start-submission.ts'
+      && edge.to === 'api/src/domain/submission-repository.ts'
+  ))
+  assert.ok(structure.nodes.every((node) =>
+    !node.includes('?')
+      && !node.includes('missing-relative-module')
+      && !node.includes('@nestjs')
+  ))
+  assert.ok(structure.edges.every(({ from, to }) =>
+    !from.includes('?')
+      && !to.includes('?')
+      && !from.includes('missing-relative-module')
+      && !to.includes('missing-relative-module')
+      && !from.includes('@nestjs')
+      && !to.includes('@nestjs')
+  ))
+  const architecture = result.evidence.dimensions.find((dimension) => dimension.dimension === 'architecture')
+  const dependencyRules = architecture.checks.find((check) => check.id === 'architecture.dependency-rules')
+  const frameworkViolation = dependencyRules.locations.find((location) =>
+    location.message?.includes('application-must-not-depend-on-frameworks')
+  )
+  assert.ok(frameworkViolation)
+  assert.deepEqual(
+    [frameworkViolation.path, frameworkViolation.line],
+    ['api/src/application/start-submission.ts', 3],
+  )
+  assert.match(frameworkViolation.snippet, /@nestjs\/common/)
+})
+
+test('still rejects unsafe actual module source paths', async () => {
+  const candidate = await mkdtemp(resolve(tmpdir(), 'ccb-evaluator-unsafe-module-'))
+  await cp(resolve(root, 'test/fixtures/passing'), candidate, { recursive: true })
+  await writeFile(resolve(candidate, 'api/src/application/unsafe\nmodule.ts'), 'export const unsafe = true\n')
+
+  assert.deepEqual(await evaluateCandidate(candidate), {
+    status: 'evaluator_error',
+    diagnostic: {
+      schemaVersion: 1,
+      phase: 'candidate_inspection',
+      code: 'candidate_path_invalid',
+      reason: 'candidate path cannot be represented safely',
+    },
+  })
+})
+
 test('requires imported providers to be registered in Nest arrays', async () => {
   const candidate = await mkdtemp(resolve(tmpdir(), 'ccb-evaluator-registration-'))
   await cp(resolve(root, 'test/fixtures/passing'), candidate, { recursive: true })

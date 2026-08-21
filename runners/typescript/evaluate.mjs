@@ -76,6 +76,7 @@ function phaseError(error, phase, code, fallback) {
 async function inspectCandidateTree(candidate) {
   const directories = [candidate]
   const files = []
+  const seenCandidatePaths = new Set()
   let entries = 0
   let bytes = 0
 
@@ -92,7 +93,12 @@ async function inspectCandidateTree(candidate) {
       else if (entry.isFile()) {
         bytes += (await stat(path)).size
         if (bytes > MAX_CANDIDATE_BYTES) throw new EvaluatorFailure('candidate_inspection', 'candidate_limits_exceeded', 'candidate exceeds static-analysis byte limit')
-        files.push({ path, relativePath: candidateEvidencePath(relative(candidate, path).replaceAll('\\', '/')) })
+        const relativePath = candidateEvidencePath(relative(candidate, path).replaceAll('\\', '/'))
+        if (seenCandidatePaths.has(relativePath)) {
+          throw new EvaluatorFailure('candidate_inspection', 'candidate_path_invalid', 'candidate file paths collide after normalization')
+        }
+        seenCandidatePaths.add(relativePath)
+        files.push({ path, relativePath })
       } else {
         throw new EvaluatorFailure('candidate_inspection', 'candidate_tree_invalid', 'candidate must contain only regular files and directories')
       }
@@ -329,23 +335,33 @@ async function dependencyPathLocations(files, graph, path) {
   return Promise.all(path.slice(0, edgeCount).map((from, index) => dependencyLocation(files, graph, from, path[index + 1])))
 }
 
-function architectureStructure(graph) {
+
+function architectureStructure(graph, files) {
   const edges = []
-  const nodePaths = new Set()
   const edgeKeys = new Set()
+  const candidateFiles = new Set(files.map((file) => normalizedModulePath(file.relativePath)))
+  const internalModules = new Map()
   for (const module of graph.modules) {
-    const from = candidateEvidencePath(module.source)
-    nodePaths.add(from)
+    if (typeof module.source !== 'string') continue
+    const normalized = normalizedModulePath(module.source)
+    if (!candidateFiles.has(normalized)) continue
+    internalModules.set(normalized, candidateEvidencePath(module.source))
+  }
+  for (const module of graph.modules) {
+    if (typeof module.source !== 'string') continue
+    const from = internalModules.get(normalizedModulePath(module.source))
+    if (from === undefined) continue
     for (const dependency of module.dependencies ?? []) {
-      const to = candidateEvidencePath(dependency.resolved)
-      nodePaths.add(to)
+      if (typeof dependency.resolved !== 'string') continue
+      const to = internalModules.get(normalizedModulePath(dependency.resolved))
+      if (to === undefined) continue
       const key = `${from}\0${to}`
       if (edgeKeys.has(key)) continue
       edgeKeys.add(key)
       edges.push({ from, to })
     }
   }
-  const nodes = [...nodePaths].sort()
+  const nodes = [...internalModules.values()].sort()
   edges.sort((left, right) => `${left.from}\0${left.to}`.localeCompare(`${right.from}\0${right.to}`))
   return {
     nodes,
@@ -594,7 +610,7 @@ async function architectureEvaluation(graph, expectations, files) {
     qualified: checks.every((check) => !check.mandatory || check.status === 'passed'),
     violations: checks.reduce((total, check) => total + check.violations, 0),
     checks,
-    structure: architectureStructure(graph),
+    structure: architectureStructure(graph, files),
   }
 }
 
@@ -1094,10 +1110,11 @@ try {
     throw new EvaluatorFailure('rule_pack', 'rule_pack_invalid', safeFailureReason(error, 'rule pack could not be loaded'))
   }
 
-  const graph = await analyzeDependencies(candidate, ruleConfig)
-  if (graph === null) {
+  const analyzedGraph = await analyzeDependencies(candidate, ruleConfig)
+  if (analyzedGraph === null || !Array.isArray(analyzedGraph.modules)) {
     throw new EvaluatorFailure('dependency_analysis', 'dependency_analysis_failed', 'dependency analysis did not produce a valid graph')
   }
+  const graph = analyzedGraph
   let architecture
   try {
     architecture = await architectureEvaluation(graph, rulePack.architecture, files)
